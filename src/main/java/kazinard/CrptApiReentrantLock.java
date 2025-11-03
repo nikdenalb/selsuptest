@@ -16,24 +16,23 @@ import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * Class for interacting with the CRPT API
- * Thread-safe with lock-free sliding window rate limiter
- * <p>
- * See <strong>{@link CrptApiReentrantLock}</strong> for an alternative version.
+ * Alternative version of the class for interacting with the CRPT API.
+ * Thread-safe with sliding window rate limiter using ReentrantLock and Condition to avoid busy-waiting.
  */
-public class CrptApi {
+public class CrptApiReentrantLock {
 
     private final int requestLimit;
     private final long windowMillis;
     private final Queue<Long> requestTimestamps = new ConcurrentLinkedQueue<>();
-    private final AtomicInteger currentCount = new AtomicInteger(0);
+    private final ReentrantLock lock = new ReentrantLock();
+    private final Condition rateLimitCondition = lock.newCondition();
     private final HttpClient httpClient = HttpClient.newHttpClient();
     private final ObjectMapper objectMapper = new ObjectMapper().registerModule(new JavaTimeModule());
 
@@ -41,7 +40,7 @@ public class CrptApi {
      * @param timeUnit     Time unit for the interval (SECONDS, MINUTES, etc.).
      * @param requestLimit Maximum number of requests in the interval.
      */
-    public CrptApi(TimeUnit timeUnit, int requestLimit) {
+    public CrptApiReentrantLock(TimeUnit timeUnit, int requestLimit) {
         this.requestLimit = requestLimit;
         this.windowMillis = timeUnit.toMillis(1);
     }
@@ -50,36 +49,52 @@ public class CrptApi {
      * Creates a document for introducing goods produced in the Russian Federation into circulation.
      *
      * @param document  Document object
-     * @param signature Signature (УКЭП) in base64
+     * @param signature Signature (УКЭП)
      * @throws Exception If request or parsing error occurs
      */
     public void createDocument(Document document, String signature) throws Exception {
-        while (true) {
+        lock.lock();
+        try {
             long now = System.currentTimeMillis();
 
-            while (true) {
+            while (!requestTimestamps.isEmpty()) {
                 Long oldest = requestTimestamps.peek();
                 if (oldest == null || oldest >= now - windowMillis) {
                     break;
                 }
-                if (Objects.equals(requestTimestamps.poll(), oldest)) {
-                    currentCount.decrementAndGet();
+                requestTimestamps.poll();
+                rateLimitCondition.signalAll();
+            }
+
+            while (requestTimestamps.size() >= requestLimit) {
+                Long oldest = requestTimestamps.peek();
+                if (oldest == null) {
+                    break;
+                }
+                long waitMillis = (oldest + windowMillis) - now;
+                if (waitMillis > 0) {
+                    rateLimitCondition.await(waitMillis, TimeUnit.MILLISECONDS);
+                }
+                now = System.currentTimeMillis();
+
+                while (!requestTimestamps.isEmpty()) {
+                    Long oldestInLoop = requestTimestamps.peek();
+                    if (oldestInLoop == null || oldestInLoop >= now - windowMillis) {
+                        break;
+                    }
+                    requestTimestamps.poll();
+                    rateLimitCondition.signalAll();
                 }
             }
 
-            int oldCount = currentCount.getAndIncrement();
-            if (oldCount < requestLimit) {
-                requestTimestamps.add(now);
-                break;
-            } else {
-                currentCount.decrementAndGet();
-                Thread.sleep(50);
-            }
+            requestTimestamps.add(now);
+
+        } finally {
+            lock.unlock();
         }
 
         String documentJson = objectMapper.writeValueAsString(document);
         String base64Document = Base64.getEncoder().encodeToString(documentJson.getBytes(StandardCharsets.UTF_8));
-
 
         Map<String, String> requestBody = new HashMap<>();
         requestBody.put("document_format", "MANUAL");
@@ -100,6 +115,7 @@ public class CrptApi {
         if (response.statusCode() != 200 && response.statusCode() != 201) {
             throw new RuntimeException("API request failed: " + response.statusCode() + ", body: " + response.body());
         }
+
     }
 
 
